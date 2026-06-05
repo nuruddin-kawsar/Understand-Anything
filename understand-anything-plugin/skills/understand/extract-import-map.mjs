@@ -205,6 +205,7 @@ function parseTsConfigText(raw) {
  */
 async function loadTsConfigs(projectRoot, files) {
   const out = new Map();
+  const warnings = [];
   // Collect the candidate paths in the original file order before reading,
   // so warning emit order matches the previous sequential implementation.
   const candidates = [];
@@ -220,7 +221,7 @@ async function loadTsConfigs(projectRoot, files) {
   for (const { key: p, raw, err } of reads) {
     if (err) {
       // absPath isn't carried through the helper return shape; reconstruct it.
-      process.stderr.write(
+      warnings.push(
         `Warning: extract-import-map: tsconfig.json at ${join(projectRoot, p)} failed ` +
         `to read (${err.message}) — path aliases from this config will ` +
         `not be applied — relative imports unaffected\n`,
@@ -229,7 +230,7 @@ async function loadTsConfigs(projectRoot, files) {
     }
     const parsed = parseTsConfigText(raw);
     if (!parsed) {
-      process.stderr.write(
+      warnings.push(
         `Warning: extract-import-map: tsconfig.json at ${join(projectRoot, p)} failed ` +
         `to parse — path aliases from this config will not be applied ` +
         `— relative imports unaffected\n`,
@@ -238,7 +239,7 @@ async function loadTsConfigs(projectRoot, files) {
     }
     out.set(dirOf(p), parsed);
   }
-  return out;
+  return { configs: out, warnings };
 }
 
 /**
@@ -267,6 +268,12 @@ async function loadTsConfigs(projectRoot, files) {
  */
 async function loadGoModules(projectRoot, files) {
   const out = new Map();
+  // loadGoModules currently emits no warnings (read failures are silently
+  // skipped — per-file resolvers surface "no ancestor go.mod" later), but
+  // the `{ data, warnings }` shape matches loadTsConfigs / loadPhpAutoloads
+  // so the concurrent caller in buildResolutionContext can drain them
+  // uniformly in canonical order.
+  const warnings = [];
   const candidates = [];
   for (const f of files) {
     const p = toPosix(f.path);
@@ -289,7 +296,7 @@ async function loadGoModules(projectRoot, files) {
     if (!moduleName) continue;
     out.set(dirOf(p), moduleName);
   }
-  return out;
+  return { modules: out, warnings };
 }
 
 /**
@@ -340,11 +347,26 @@ async function buildResolutionContext(projectRoot, files) {
   // The three config-loader passes are independent and each does its own
   // batched parallel I/O; run them concurrently so the wait for a slow
   // tsconfig.json read doesn't block go.mod / composer.json scanning.
-  const [tsConfigs, goModules, phpAutoloads] = await Promise.all([
+  //
+  // Each loader BUFFERS warnings into a private array rather than writing
+  // them to stderr inline. If a loader streamed warnings directly during
+  // the concurrent passes, lines from independent loader families could
+  // interleave based on I/O timing — that would break the pre-PR
+  // deterministic order (ts → go → php) and make stderr-diff verification
+  // flaky. Drain the buffers in canonical order *after* Promise.all, so
+  // a fixture with `(malformed tsconfig.json, malformed composer.json)`
+  // always emits `tsconfig…\ncomposer…\n`, never the reverse.
+  const [tsResult, goResult, phpResult] = await Promise.all([
     loadTsConfigs(projectRoot, files),
     loadGoModules(projectRoot, files),
     loadPhpAutoloads(projectRoot, files),
   ]);
+  for (const w of tsResult.warnings) process.stderr.write(w);
+  for (const w of goResult.warnings) process.stderr.write(w);
+  for (const w of phpResult.warnings) process.stderr.write(w);
+  const tsConfigs = tsResult.configs;
+  const goModules = goResult.modules;
+  const phpAutoloads = phpResult.autoloads;
 
   // Index .go files by their parent directory so the Go resolver can
   // expand a package-level import to all member .go files in O(1).
@@ -1054,6 +1076,7 @@ function parseComposerAutoloadText(raw) {
  */
 async function loadPhpAutoloads(projectRoot, files) {
   const out = new Map();
+  const warnings = [];
   const candidates = [];
   for (const f of files) {
     const p = toPosix(f.path);
@@ -1066,7 +1089,7 @@ async function loadPhpAutoloads(projectRoot, files) {
   const reads = await readFilesParallel(candidates);
   for (const { key: p, raw, err } of reads) {
     if (err) {
-      process.stderr.write(
+      warnings.push(
         `Warning: extract-import-map: composer.json at ${join(projectRoot, p)} failed ` +
         `to read (${err.message}) — PSR-4 namespace mapping from this ` +
         `composer.json unavailable — PHP imports under this package ` +
@@ -1076,7 +1099,7 @@ async function loadPhpAutoloads(projectRoot, files) {
     }
     const parsed = parseComposerAutoloadText(raw);
     if (parsed === null) {
-      process.stderr.write(
+      warnings.push(
         `Warning: extract-import-map: composer.json at ${join(projectRoot, p)} failed ` +
         `to parse — PSR-4 namespace mapping unavailable — PHP imports ` +
         `under this package will not resolve\n`,
@@ -1085,7 +1108,7 @@ async function loadPhpAutoloads(projectRoot, files) {
     }
     out.set(dirOf(p), parsed);
   }
-  return out;
+  return { autoloads: out, warnings };
 }
 
 /**
